@@ -1,0 +1,109 @@
+#!/bin/bash
+
+# AWS_DEFAULT_REGION
+# and
+# AWS_ACCESS_KEY_ID
+# AWS_SECRET_ACCESS_KEY
+# or
+# AWS_DEFAULT_PROFILE
+# and
+# DNS_NAME
+
+if [ -n "$1" ]; then
+    dns_name=$1
+else
+    dns_name=$DNS_NAME
+fi
+
+if [ -z "$dns_name" ]; then
+  echo "missing dns name"
+  exit 1
+fi
+
+if [ -z "$DNS_TTL" ]; then
+    DNS_TTL=60
+fi
+
+if [ -z "$DAEMON" ]; then
+    DAEMON="false"
+fi
+
+if [ -z "$SLEEP" ]; then
+    SLEEP=21600
+fi
+
+function set_record() {
+
+    ip_address=$(curl --silent --retry 5 --connect-timeout 10 \
+        http://wtfismyip.com/text)
+    if [ "$?" != "0" ]; then
+        ip_address=$(curl --silent --retry 5 --connect-timeout 10 \
+            https://diagnostic.opendns.com/myip)
+    fi
+    if [ "$?" != "0" ]; then
+        ip_address=$(dig +short myip.opendns.com @resolver1.opendns.com)
+    fi
+
+    domain_name=$dns_name
+    while echo $domain_name |egrep -q '\.'; do
+        domain_name=$(echo $domain_name |cut -f2- -d.)
+        zoneid=$(aws route53 list-hosted-zones --output text \
+            |grep HOSTEDZONES \
+            |egrep "\s$domain_name\." \
+            |cut -f3 \
+            |cut -d\/ -f3)
+        if [ -n "$zoneid" ]; then
+            break
+        fi
+    done
+
+    if [ -z "$zoneid" ]; then
+        echo "could not get route53 zone id"
+        exit 1
+    fi
+
+    batchfile=$(mktemp)
+    cat >$batchfile <<EOL
+{
+  "Comment": "A ${dns_name} ${ip_address}",
+  "Changes": [
+    {
+      "Action": "UPSERT",
+      "ResourceRecordSet": {
+        "Name": "${dns_name}",
+        "Type": "A",
+        "TTL": ${DNS_TTL},
+        "ResourceRecords": [
+          {"Value": "${ip_address}"}
+        ]
+      }
+    }
+  ]
+}
+EOL
+
+    cat $batchfile
+
+    aws route53 change-resource-record-sets \
+        --hosted-zone-id $zoneid \
+        --change-batch file:///$batchfile
+    ret=$1
+
+    rm -f $batchfile
+
+    return $ret
+}
+
+if [ "$DAEMON" == "true" ]; then
+    while true; do
+        set_record
+        if [ "$?" != "0" ]; then
+            exit $1
+        fi
+        echo "sleeping $SLEEP seconds"
+        sleep $SLEEP
+    done
+else
+    set_record
+    exit $1
+fi
